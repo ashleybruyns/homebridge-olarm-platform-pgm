@@ -5,7 +5,25 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [1.0.5] - 2025-01-08
+## [1.0.6] - 2025-10-14
+
+### Fixed
+- **Critical:** Fixed MQTT reconnection storm when access token expires (was reconnecting 600+ times/hour)
+- **Critical:** Fixed MQTT authentication loop - now properly refreshes token and reconnects automatically
+- Added authentication error detection in MQTT error handler
+- Disabled auto-reconnect when authentication fails to prevent log spam
+- Added debounced token refresh to prevent multiple simultaneous refresh attempts
+
+### Changed
+- Improved MQTT error handling with automatic token refresh
+- Enhanced reconnection logic to detect excessive reconnection attempts (>50/hour triggers token refresh)
+- MQTT now gracefully recovers from token expiration without manual intervention
+
+### Improved
+- Better logging for authentication failures and token refresh events
+- Automatic fallback to API polling if token refresh fails
+
+## [1.0.5] - 2025-10-04
 
 ### Fixed
 - Fixed `pluginAlias` registration causing platform to appear as "ExampleHomebridgePlugin" in Homebridge UI
@@ -54,6 +72,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Automatic token refresh to prevent expiration
 
 ---
+
+[1.0.6]: https://github.com/vangogh27/homebridge-olarm-platform/releases/tag/v1.0.6
 [1.0.5]: https://github.com/vangogh27/homebridge-olarm-platform/releases/tag/v1.0.5
 [1.0.4]: https://github.com/vangogh27/homebridge-olarm-platform/releases/tag/v1.0.4
 [1.0.2]: https://github.com/vangogh27/homebridge-olarm-platform/releases/tag/v1.0.2

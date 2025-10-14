@@ -2,7 +2,7 @@
   "name": "homebridge-olarm-platform",
   "displayName": "Olarm Security System",
   "type": "module",
-  "version": "1.0.5",
+  "version": "1.0.6",
   "description": "A comprehensive Homebridge plugin for Olarm security systems with real-time MQTT events and zone discovery.",
   "author": "Louis Germishuys",
   "license": "Apache-2.0",

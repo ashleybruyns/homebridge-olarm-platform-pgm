@@ -13,6 +13,7 @@ export class OlarmController {
   private auth: OlarmAuth | null = null;
   private onStateUpdate: (deviceData: DeviceData) => void = () => { };
   private previousState: DeviceState | null = null;
+  private authErrorHandled = false;
 
   constructor(
     private readonly platform: OlarmPlatform,
@@ -24,7 +25,7 @@ export class OlarmController {
   connect(auth: OlarmAuth): void {
     this.auth = auth;
     const device = this.auth.getDevice();
-    
+
     if (!device) {
       this.platform.log.error('Controller: No matching device found. Activating polling fallback.');
       this.activatePollingFallback();
@@ -51,7 +52,7 @@ export class OlarmController {
     this.mqttClient.on('connect', () => {
       this.platform.log.info('Controller: MQTT connected successfully');
       this.deactivatePollingFallback();
-      
+
       const topic = `so/app/v1/${device.IMEI}`;
       this.mqttClient!.subscribe(topic, { qos: 1 }, (err) => {
         if (!err) {
@@ -92,6 +93,26 @@ export class OlarmController {
 
     this.mqttClient.on('error', (err) => {
       this.platform.log.error('Controller: MQTT error:', err.message);
+
+      // Check if it's an authentication error
+      if (err.message.includes('Bad username or password') || err.message.includes('Not authorized')) {
+        this.platform.log.warn('Controller: MQTT authentication failed - token may have expired');
+
+        // Disable auto-reconnect to prevent spam
+        if (this.mqttClient) {
+          this.mqttClient.options.reconnectPeriod = 0;
+        }
+
+        // Schedule token refresh (debounced to prevent multiple attempts)
+        if (!this.authErrorHandled) {
+          this.authErrorHandled = true;
+          setTimeout(() => {
+            this.handleAuthError().then(() => {
+              this.authErrorHandled = false;
+            });
+          }, 1000);
+        }
+      }
     });
 
     this.mqttClient.on('close', () => {
@@ -107,6 +128,12 @@ export class OlarmController {
         this.platform.log.error(
           `Controller: MQTT reconnected ${this.platform.reconnectTimestamps.length} times in the last hour - check network stability`,
         );
+
+        // If reconnecting too much, try refreshing token
+        if (this.platform.reconnectTimestamps.length > 50) {
+          this.platform.log.warn('Controller: Excessive reconnections detected - attempting token refresh');
+          this.handleAuthError();
+        }
       }
 
       if (this.stateRequestInterval) {
@@ -352,6 +379,38 @@ export class OlarmController {
       this.platform.log.info('Controller: Polling deactivated (MQTT active)');
       clearInterval(this.pollingTimer);
       this.pollingTimer = null;
+    }
+  }
+
+  /**
+   * Handle authentication errors by refreshing token and reconnecting
+   */
+  private async handleAuthError(): Promise<void> {
+    if (!this.auth) {
+      return;
+    }
+
+    this.platform.log.info('Controller: Refreshing authentication token...');
+
+    try {
+      // Disconnect existing MQTT client to stop reconnect loop
+      if (this.mqttClient) {
+        this.mqttClient.removeAllListeners();
+        this.mqttClient.end(true);
+        this.mqttClient = null;
+      }
+
+      // Refresh the access token
+      await this.auth.ensureAccessTokenIsValid();
+
+      this.platform.log.info('Controller: Token refreshed successfully, reconnecting to MQTT...');
+
+      // Reconnect with new token
+      this.connect(this.auth);
+    } catch (error) {
+      this.platform.log.error(`Controller: Failed to refresh token: ${(error as Error).message}`);
+      this.platform.log.warn('Controller: Falling back to API polling');
+      this.activatePollingFallback();
     }
   }
 
