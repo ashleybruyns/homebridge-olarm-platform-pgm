@@ -59,18 +59,32 @@ export class OlarmSecuritySystem {
   /**
    * Update the state of this accessory in HomeKit
    */
-  updateState(deviceState: DeviceState, deviceStatus: 'online' | 'offline'): void {
+  updateState(deviceState: DeviceState, deviceStatus: string | undefined): void {
     const areaState = deviceState.areas[0] || 'disarm';
     
+    // Area states as reported by the Olarm public API
     const stateMap: Record<string, number> = {
       'disarm': 3,
+      'notready': 3,
+      'countdown': 3,
       'arm': 1,
       'stay': 0,
+      'stayarm1': 0,
+      'stayarm2': 0,
+      'stayarm3': 0,
+      'stayarm4': 0,
       'sleep': 2,
       'alarm': 4,
-      'countdown': 3,
+      'emergency': 4,
+      'fire': 4,
+      'medical': 4,
     };
-    
+
+    // During the entry delay the area is still armed; keep the current state
+    if (areaState === 'entrydelay') {
+      return;
+    }
+
     const homekitState = stateMap[areaState] ?? 3;
 
     // Get current state
@@ -92,7 +106,7 @@ export class OlarmSecuritySystem {
     this.service.updateCharacteristic(this.platform.api.hap.Characteristic.SecuritySystemTargetState, homekitState);
     this.service.updateCharacteristic(
       this.platform.api.hap.Characteristic.StatusFault,
-      deviceStatus === 'online' ? 0 : 1,
+      deviceStatus === 'offline' ? 1 : 0,
     );
   }
 }

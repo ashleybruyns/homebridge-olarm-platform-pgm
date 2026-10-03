@@ -2,8 +2,8 @@
   "pluginAlias": "Olarm",
   "pluginType": "platform",
   "singular": true,
-  "headerDisplay": "For setup instructions, see the [README](https://github.com/vangogh27/homebridge-olarm-platform#readme)",
-  "footerDisplay": "For help and support, please visit the [GitHub repository](https://github.com/vangogh27/homebridge-olarm-platform/issues)",
+  "headerDisplay": "For setup instructions, see the [README](https://github.com/ashleybruyns/homebridge-olarm-platform-pgm#readme).",
+  "footerDisplay": "For help and support, please visit the [GitHub repository](https://github.com/ashleybruyns/homebridge-olarm-platform-pgm/issues). Forked from [homebridge-olarm-platform](https://github.com/vangogh27/homebridge-olarm-platform), created by Louis Germishuys.",
   "schema": {
     "type": "object",
     "properties": {
@@ -31,37 +31,17 @@
         "default": "Olarm Security",
         "description": "The name displayed in HomeKit for the security system"
       },
-      "primaryAuth": {
-        "title": "Primary Authentication",
-        "type": "object",
+      "apiKey": {
+        "title": "API Key",
+        "type": "string",
         "required": true,
-        "properties": {
-          "email": {
-            "title": "Email",
-            "type": "string",
-            "required": true,
-            "format": "email",
-            "description": "Your Olarm account email",
-            "placeholder": "user@example.com"
-          },
-          "password": {
-            "title": "Password",
-            "type": "string",
-            "required": true,
-            "description": "Your Olarm account password"
-          }
-        }
+        "description": "Generate one in the Olarm user portal (https://user.olarm.com) under API access"
       },
-      "fallbackAuth": {
-        "title": "Fallback Authentication (Optional)",
-        "type": "object",
-        "properties": {
-          "apiKey": {
-            "title": "API Key",
-            "type": "string",
-            "description": "Optional API key for fallback polling when MQTT disconnects"
-          }
-        }
+      "mqttClientIdSuffix": {
+        "title": "MQTT Client ID Suffix",
+        "type": "string",
+        "placeholder": "8",
+        "description": "Must differ from any other Olarm integration (e.g. Home Assistant) connected with the same account. Default: 8"
       },
       "includedZones": {
         "title": "Included Zones",
@@ -124,6 +104,47 @@
             }
           }
         }
+      },
+      "gates": {
+        "title": "Gates",
+        "type": "array",
+        "items": {
+          "type": "object",
+          "properties": {
+            "id": {
+              "title": "ID",
+              "type": "string",
+              "description": "Unique identifier for this gate (optional; defaults to the zone and PGM numbers)"
+            },
+            "name": {
+              "title": "Name",
+              "type": "string",
+              "required": true,
+              "description": "Name displayed in HomeKit (e.g. 'Driveway Gate')"
+            },
+            "zone": {
+              "title": "Zone Number",
+              "type": "integer",
+              "minimum": 1,
+              "required": true,
+              "description": "Olarm zone number whose sensor is closed only when the gate is fully closed"
+            },
+            "pgm": {
+              "title": "PGM Number",
+              "type": "integer",
+              "minimum": 1,
+              "required": true,
+              "description": "Olarm PGM number that is pulsed to trigger the gate motor (must be enabled with pulse control on the panel)"
+            },
+            "operationTime": {
+              "title": "Operation Time (seconds)",
+              "type": "integer",
+              "default": 20,
+              "minimum": 1,
+              "description": "How long the gate takes to fully open or close. Further open/close requests are blocked for this long after each pulse."
+            }
+          }
+        }
       }
     }
   },
@@ -146,18 +167,17 @@
       "title": "Authentication",
       "expandable": false,
       "items": [
-        "primaryAuth.email",
-        "primaryAuth.password"
+        "apiKey"
       ]
     },
     {
       "type": "fieldset",
-      "title": "Fallback API",
+      "title": "Connection",
       "expandable": true,
       "expanded": false,
       "items": [
-        "fallbackAuth.apiKey",
-        "pollingInterval"
+        "pollingInterval",
+        "mqttClientIdSuffix"
       ]
     },
     {
@@ -196,6 +216,27 @@
             "automations[].name",
             "automations[].zones",
             "automations[].armMode"
+          ]
+        }
+      ]
+    },
+    {
+      "type": "fieldset",
+      "title": "Gates",
+      "expandable": true,
+      "expanded": false,
+      "description": "Combines an Olarm zone (open/closed state) with a PGM (pulsed to trigger the gate motor) as a HomeKit Garage Door. The PGM must be enabled and allow pulse control on the panel.",
+      "items": [
+        {
+          "key": "gates",
+          "type": "array",
+          "title": "{{ value.name || 'New Gate' }}",
+          "items": [
+            "gates[].id",
+            "gates[].name",
+            "gates[].zone",
+            "gates[].pgm",
+            "gates[].operationTime"
           ]
         }
       ]
