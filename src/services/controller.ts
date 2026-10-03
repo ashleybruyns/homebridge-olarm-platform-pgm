@@ -1,90 +1,174 @@
 import mqtt from 'mqtt';
-import axios from 'axios';
-import { NATIVE_MQTT_HOST, NATIVE_MQTT_PORT, NATIVE_MQTT_USERNAME, PUBLIC_API_BASE_URL } from '../settings.js';
+import axios, { AxiosInstance } from 'axios';
+import { API_BASE_URL, DEFAULT_MQTT_CLIENT_ID_SUFFIX, MQTT_URL, MQTT_USERNAME } from '../settings.js';
 import type { OlarmPlatform } from '../platform.js';
-import type { OlarmAuth } from './auth.js';
-import type { DeviceData, DeviceState, MqttPayload } from '../types.js';
+import type { DeviceData, DeviceState, OlarmDevicesResponse, OlarmMqttPayload } from '../types.js';
 
+/**
+ * Timeout for Olarm REST API requests. Kept short so a HomeKit request that
+ * waits on them still answers within HomeKit's ~10s limit.
+ */
+const API_TIMEOUT_MS = 4000;
+
+/**
+ * Delay between MQTT reconnect attempts, and between retries of the initial
+ * account lookup needed to connect.
+ */
+const MQTT_RECONNECT_MS = 10000;
+const MQTT_RECONNECT_MAX_MS = 5 * 60 * 1000;
+const START_RETRY_MS = 60000;
+
+/**
+ * HomeKit-style area commands mapped to Olarm public API action commands
+ */
+const AREA_ACTIONS: Record<string, string> = {
+  arm: 'area-arm',
+  stay: 'area-stay',
+  sleep: 'area-sleep',
+  disarm: 'area-disarm',
+};
+
+/**
+ * OlarmController
+ * Talks to the Olarm public API: device state and commands over REST
+ * (https://api.olarm.com/api/v4), and real-time state over the public MQTT
+ * feed. MQTT only pushes changes, so the REST API is used for the initial
+ * state, to resync after reconnecting, and as a polling fallback.
+ */
 export class OlarmController {
   public mqttClient: mqtt.MqttClient | null = null;
   public pollingTimer: NodeJS.Timeout | null = null;
-  public stateRequestInterval: NodeJS.Timeout | null = null;
   public deviceData: DeviceData | null = null;
-  private auth: OlarmAuth | null = null;
   private onStateUpdate: (deviceData: DeviceData) => void = () => { };
   private previousState: DeviceState | null = null;
-  private authErrorHandled = false;
+  private readonly http: AxiosInstance;
+  private startRetryTimer: NodeJS.Timeout | null = null;
+  private reconnectTimestamps: number[] = [];
+  private connectedSinceAttempt = false;
+  private failedAttempts = 0;
+  private stopped = false;
 
   constructor(
     private readonly platform: OlarmPlatform,
-  ) { }
+    private readonly apiKey: string,
+  ) {
+    this.http = axios.create({
+      baseURL: API_BASE_URL,
+      timeout: API_TIMEOUT_MS,
+      headers: { Authorization: `Bearer ${apiKey}` },
+    });
+  }
+
+  private get deviceId(): string {
+    return this.platform.config.deviceId;
+  }
+
+  get isMqttConnected(): boolean {
+    return !!this.mqttClient?.connected;
+  }
 
   /**
-   * Connect to MQTT broker with native app authentication
+   * Look up the account's user id (needed for the MQTT client id) and confirm
+   * the configured device is accessible, then connect to the MQTT feed.
+   * Retries in the background if the API can't be reached.
    */
-  connect(auth: OlarmAuth): void {
-    this.auth = auth;
-    const device = this.auth.getDevice();
+  async start(): Promise<void> {
+    if (this.stopped) {
+      return;
+    }
 
-    if (!device) {
-      this.platform.log.error('Controller: No matching device found. Activating polling fallback.');
+    let account: OlarmDevicesResponse;
+    try {
+      const response = await this.http.get<OlarmDevicesResponse>('/devices', {
+        params: { page: 1, pageLength: 100, deviceApiAccessOnly: 1 },
+      });
+      account = response.data;
+    } catch (e) {
+      this.platform.log.error(`Controller: Could not fetch devices from the Olarm API: ${(e as Error).message}. Retrying in 60s.`);
+      this.activatePollingFallback();
+      this.startRetryTimer = setTimeout(() => this.start(), START_RETRY_MS);
+      return;
+    }
+
+    const devices = account.data ?? [];
+    if (!devices.some(d => d.deviceId === this.deviceId)) {
+      this.platform.log.error(
+        `Controller: Device "${this.deviceId}" was not found among the devices this API key can access. ` +
+        'Make sure API access is enabled for it in the Olarm user portal. Available devices: ' +
+        (devices.map(d => `${d.deviceName ?? 'unnamed'} (${d.deviceId})`).join(', ') || 'none'),
+      );
+      return;
+    }
+
+    if (!account.userId) {
+      this.platform.log.error('Controller: The Olarm API did not return a user id; cannot connect to MQTT. Using API polling.');
       this.activatePollingFallback();
       return;
     }
 
-    const mqttOptions: mqtt.IClientOptions = {
-      host: NATIVE_MQTT_HOST,
-      port: NATIVE_MQTT_PORT,
-      protocol: 'wss',
-      username: NATIVE_MQTT_USERNAME,
-      password: this.auth.getAccessToken() || undefined,
-      clientId: `native-app-oauth-${device.IMEI}`,
+    this.connectMqtt(account.userId);
+  }
+
+  /**
+   * Connect to the public MQTT feed and subscribe to the device
+   */
+  private connectMqtt(userId: string): void {
+    const suffix = this.platform.config.mqttClientIdSuffix || DEFAULT_MQTT_CLIENT_ID_SUFFIX;
+    const topic = `v4/devices/${this.deviceId}`;
+
+    const clientId = `${userId}-${suffix}`;
+    this.platform.log.info('Controller: Connecting to Olarm MQTT feed...');
+    this.platform.log.debug(`Controller: MQTT client id "${clientId}", topic "${topic}"`);
+    this.mqttClient = mqtt.connect(MQTT_URL, {
+      username: MQTT_USERNAME,
+      password: this.apiKey,
+      clientId,
       protocolVersion: 4,
-      reconnectPeriod: 5000,
+      reconnectPeriod: MQTT_RECONNECT_MS,
       connectTimeout: 10000,
       clean: true,
       keepalive: 30,
-    };
-
-    this.platform.log.info('Controller: Connecting to MQTT broker...');
-    this.mqttClient = mqtt.connect(mqttOptions);
+    });
 
     this.mqttClient.on('connect', () => {
-      this.platform.log.info('Controller: MQTT connected successfully');
-      this.deactivatePollingFallback();
-
-      const topic = `so/app/v1/${device.IMEI}`;
+      this.platform.log.info('Controller: MQTT connected');
+      this.connectedSinceAttempt = true;
+      this.failedAttempts = 0;
+      this.mqttClient!.options.reconnectPeriod = MQTT_RECONNECT_MS;
       this.mqttClient!.subscribe(topic, { qos: 1 }, (err) => {
-        if (!err) {
-          this.platform.log.info('Controller: Subscribed to device updates');
-          this.startPeriodicStateRequests(device.IMEI);
-        } else {
-          this.platform.log.error('Controller: MQTT subscription failed:', err);
+        if (err) {
+          this.platform.log.error('Controller: MQTT subscription failed:', err.message);
+          return;
         }
+        this.platform.log.info('Controller: Subscribed to device updates');
+        this.deactivatePollingFallback();
+        // MQTT only pushes changes; resync anything missed while disconnected
+        this.refreshState();
       });
     });
 
-    this.mqttClient.on('message', (topic, message) => {
+    this.mqttClient.on('message', (_topic, message) => {
       try {
-        const payload = JSON.parse(message.toString()) as MqttPayload;
-        this.platform.log.debug(`Controller: MQTT message received - type: ${payload.type}`);
-
-        if (payload && payload.type === 'alarmPayload' && payload.data) {
-          if (!this.deviceData) {
-            this.deviceData = { deviceState: {} as DeviceState, deviceStatus: 'online', deviceProfile: {} };
-          }
-
-          // Detect and log specific state changes
-          this.logStateChanges(payload.data);
-
-          this.deviceData.deviceState = payload.data;
-          this.deviceData.deviceStatus = 'online';
-
-          this.platform.log.info('Controller: Processing MQTT state update');
+        const payload = JSON.parse(message.toString()) as OlarmMqttPayload;
+        this.platform.log.debug(`Controller: MQTT message with fields: ${Object.keys(payload).join(', ') || '(none)'}`);
+        if (!this.deviceData) {
+          return;
+        }
+        let updated = false;
+        if (payload.deviceState) {
+          this.applyState(payload.deviceState);
+          updated = true;
+        }
+        if (payload.deviceStatus) {
+          this.deviceData.deviceStatus = payload.deviceStatus;
+          updated = true;
+        }
+        if (payload.deviceProfile) {
+          this.deviceData.deviceProfile = payload.deviceProfile;
+        }
+        if (updated) {
+          this.platform.log.debug('Controller: Processing MQTT state update');
           this.onStateUpdate(this.deviceData);
-
-          // Store current state for next comparison
-          this.previousState = JSON.parse(JSON.stringify(payload.data));
         }
       } catch (e) {
         this.platform.log.error('Controller: Failed to process MQTT message:', (e as Error).message);
@@ -92,56 +176,93 @@ export class OlarmController {
     });
 
     this.mqttClient.on('error', (err) => {
-      this.platform.log.error('Controller: MQTT error:', err.message);
+      const code = (err as { code?: number }).code;
+      const isAuthError = code === 4 || code === 5 || code === 134 || code === 135 ||
+        err.message.includes('Not authorized') || err.message.includes('Bad username or password');
 
-      // Check if it's an authentication error
-      if (err.message.includes('Bad username or password') || err.message.includes('Not authorized')) {
-        this.platform.log.warn('Controller: MQTT authentication failed - token may have expired');
-
-        // Disable auto-reconnect to prevent spam
-        if (this.mqttClient) {
-          this.mqttClient.options.reconnectPeriod = 0;
-        }
-
-        // Schedule token refresh (debounced to prevent multiple attempts)
-        if (!this.authErrorHandled) {
-          this.authErrorHandled = true;
-          setTimeout(() => {
-            this.handleAuthError().then(() => {
-              this.authErrorHandled = false;
-            });
-          }, 1000);
-        }
+      if (isAuthError) {
+        // The API key doesn't expire, so retrying with it won't help
+        this.platform.log.error(
+          'Controller: The Olarm MQTT broker rejected the connection. Check the API key, and that ' +
+          '"mqttClientIdSuffix" is not used by another Olarm integration on this account. Using API polling instead.',
+        );
+        this.mqttClient?.end(true);
+        this.activatePollingFallback();
+        return;
       }
+      this.platform.log.error('Controller: MQTT error:', err.message);
     });
 
     this.mqttClient.on('close', () => {
-      this.platform.log.warn('Controller: MQTT connection closed');
-
-      this.platform.reconnectCount++;
-      this.platform.reconnectTimestamps.push(Date.now());
-
-      const oneHourAgo = Date.now() - (60 * 60 * 1000);
-      this.platform.reconnectTimestamps = this.platform.reconnectTimestamps.filter(t => t > oneHourAgo);
-
-      if (this.platform.reconnectTimestamps.length > 10) {
-        this.platform.log.error(
-          `Controller: MQTT reconnected ${this.platform.reconnectTimestamps.length} times in the last hour - check network stability`,
-        );
-
-        // If reconnecting too much, try refreshing token
-        if (this.platform.reconnectTimestamps.length > 50) {
-          this.platform.log.warn('Controller: Excessive reconnections detected - attempting token refresh');
-          this.handleAuthError();
-        }
-      }
-
-      if (this.stateRequestInterval) {
-        clearInterval(this.stateRequestInterval);
-        this.stateRequestInterval = null;
+      if (this.stopped) {
+        return;
       }
       this.activatePollingFallback();
+
+      if (!this.connectedSinceAttempt) {
+        // The broker closes the connection without an error when it rejects the
+        // credentials or client id, so back off rather than retrying every 10s
+        this.failedAttempts++;
+        const delay = Math.min(MQTT_RECONNECT_MS * 2 ** (this.failedAttempts - 1), MQTT_RECONNECT_MAX_MS);
+        if (this.mqttClient) {
+          this.mqttClient.options.reconnectPeriod = delay;
+        }
+        const message = `Controller: Could not connect to the Olarm MQTT feed (attempt ${this.failedAttempts}); retrying in ${delay / 1000}s. ` +
+          'If this persists, check the API key, and that "mqttClientIdSuffix" is not used by another Olarm integration on this account.';
+        if (this.failedAttempts === 1 || this.failedAttempts % 10 === 0) {
+          this.platform.log.error(message);
+        } else {
+          this.platform.log.debug(message);
+        }
+        return;
+      }
+      this.connectedSinceAttempt = false;
+      this.platform.log.warn('Controller: MQTT connection closed');
+
+      const oneHourAgo = Date.now() - (60 * 60 * 1000);
+      this.reconnectTimestamps = this.reconnectTimestamps.filter(t => t > oneHourAgo);
+      this.reconnectTimestamps.push(Date.now());
+      if (this.reconnectTimestamps.length > 10) {
+        this.platform.log.error(
+          `Controller: MQTT disconnected ${this.reconnectTimestamps.length} times in the last hour - ` +
+          'check network stability, or whether another client uses the same "mqttClientIdSuffix"',
+        );
+      }
     });
+  }
+
+  /**
+   * Fetch the device's full state from the REST API.
+   * Returns true if fresh state was received.
+   */
+  async refreshState(): Promise<boolean> {
+    try {
+      const response = await this.http.get<DeviceData>(`/devices/${this.deviceId}`, {
+        params: { deviceApiAccessOnly: 1 },
+      });
+      const data = response.data;
+      if (!data?.deviceState) {
+        this.platform.log.error('Controller: Olarm API returned no device state');
+        return false;
+      }
+      this.platform.log.debug(`Controller: Received device state from API (deviceStatus: ${data.deviceStatus ?? '(not provided)'})`);
+      this.deviceData = data;
+      this.applyState(data.deviceState);
+      this.onStateUpdate(this.deviceData);
+      return true;
+    } catch (e) {
+      this.platform.log.error(`Controller: Fetching device state failed: ${(e as Error).message}`);
+      return false;
+    }
+  }
+
+  /**
+   * Store a new device state, logging what changed since the last one
+   */
+  private applyState(newState: DeviceState): void {
+    this.logStateChanges(newState);
+    this.deviceData!.deviceState = newState;
+    this.previousState = JSON.parse(JSON.stringify(newState));
   }
 
   /**
@@ -163,11 +284,16 @@ export class OlarmController {
           const areaName = `Area ${index + 1}`;
           const stateNames: Record<string, string> = {
             'disarm': 'Disarmed',
+            'notready': 'Disarmed (Not Ready)',
             'arm': 'Armed Away',
             'stay': 'Armed Stay',
             'sleep': 'Armed Night',
             'alarm': 'ALARM TRIGGERED',
+            'emergency': 'EMERGENCY',
+            'fire': 'FIRE ALARM',
+            'medical': 'MEDICAL ALARM',
             'countdown': 'Exit Countdown',
+            'entrydelay': 'Entry Delay',
           };
           this.platform.log.info(`🔒 ${areaName}: ${stateNames[prevArea] || prevArea} → ${stateNames[area] || area}`);
         }
@@ -184,11 +310,9 @@ export class OlarmController {
 
           // Map zone states to readable descriptions
           const zoneStateMap: Record<string, string> = {
-            'r': 'Ready (Closed)',
+            'c': 'Closed',
             'a': 'Active (Open)',
             'b': 'Bypassed',
-            't': 'Tampered',
-            'f': 'Fault',
           };
 
           const prevStateDesc = zoneStateMap[prevZone] || prevZone;
@@ -200,7 +324,7 @@ export class OlarmController {
             emoji = '🚶';
           } else if (zone === 'b') {
             emoji = '⏭️';
-          } else if (zone === 't' || zone === 'f') {
+          } else if (!(zone in zoneStateMap)) {
             emoji = '⚠️';
           }
 
@@ -237,123 +361,64 @@ export class OlarmController {
   }
 
   /**
-   * Start periodic state requests over MQTT
+   * Check whether a PGM may be pulsed, from the panel profile's pgmControl flags.
+   * Returns a reason if not, or null if pulsing is allowed.
    */
-  private startPeriodicStateRequests(imei: string): void {
-    if (this.stateRequestInterval) {
-      clearInterval(this.stateRequestInterval);
+  pgmPulseProblem(pgmNum: number): string | null {
+    const controls = this.deviceData?.deviceProfile?.pgmControl;
+    if (!controls) {
+      return 'the panel profile has no PGM information (deviceProfile.pgmControl)';
     }
-
-    this.requestMqttState(imei);
-    this.stateRequestInterval = setInterval(() => {
-      this.requestMqttState(imei);
-    }, 30000);
-
-    this.platform.log.info('Controller: Started periodic state requests');
+    const control = controls[pgmNum - 1] || '000';
+    if (control[0] !== '1') {
+      return `PGM ${pgmNum} is not enabled on the panel`;
+    }
+    if (control[2] !== '1') {
+      return `PGM ${pgmNum} does not allow pulse control`;
+    }
+    return null;
   }
 
   /**
-   * Request state update via MQTT
+   * Pulse a PGM. Unlike sendCommand, failures are thrown so the caller can
+   * report them to HomeKit. A timeout does not guarantee the pulse was not delivered.
    */
-  private requestMqttState(imei: string): void {
-    if (this.mqttClient && this.mqttClient.connected) {
-      const statusTopic = `si/app/v2/${imei}/status`;
-      const message = JSON.stringify({ method: 'GET' });
-      this.mqttClient.publish(statusTopic, message, { qos: 1 });
-      this.platform.log.debug('Controller: State request sent');
+  async pulsePgm(pgmNum: number): Promise<void> {
+    const problem = this.pgmPulseProblem(pgmNum);
+    if (problem) {
+      throw new Error(`Refusing to pulse: ${problem}`);
     }
+    await this.postAction('pgm-pulse', pgmNum);
+    this.platform.log.info(`Controller: Command [pgm-pulse] sent for PGM ${pgmNum}`);
   }
 
   /**
-   * Refresh device state (via MQTT or API fallback)
-   */
-  async refreshState(): Promise<void> {
-    if (this.mqttClient && this.mqttClient.connected) {
-      const device = this.auth?.getDevice();
-      if (!device) {
-        return;
-      }
-      this.requestMqttState(device.IMEI);
-    } else {
-      const apiKey = this.platform.config.fallbackAuth?.apiKey;
-      if (!apiKey) {
-        this.platform.log.warn('Controller: API polling unavailable (no API key configured)');
-        return;
-      }
-      try {
-        const response = await axios.get(
-          `${PUBLIC_API_BASE_URL}/devices/${this.platform.config.deviceId}`,
-          { headers: { Authorization: `Bearer ${apiKey}` } },
-        );
-        if (response.data) {
-          this.platform.log.info('Controller: Received device update via API polling');
-          this.deviceData = response.data;
-          if (this.deviceData) {
-            this.onStateUpdate(this.deviceData);
-          }
-        }
-      } catch (e) {
-        this.platform.log.error(`Controller: API polling failed: ${(e as Error).message}`);
-      }
-    }
-  }
-
-  /**
-   * Send command to device (via MQTT or API)
+   * Send an area or zone command. Area commands ('arm', 'stay', 'sleep',
+   * 'disarm') act on area 1; zone commands ('zone-bypass', 'zone-unbypass')
+   * act on the given zone. Failures are logged.
    */
   async sendCommand(action: string, zoneNum = 1): Promise<void> {
-    const areaNum = 1;
+    const areaCommand = AREA_ACTIONS[action];
+    const actionCmd = areaCommand ?? action;
+    const actionNum = areaCommand ? 1 : zoneNum;
 
-    // Force zone bypass/unbypass to always use API
-    if (action.includes('zone-bypass') || action.includes('zone-unbypass')) {
-      const apiKey = this.platform.config.fallbackAuth?.apiKey;
-      if (!apiKey) {
-        this.platform.log.error('API key required for zone bypass commands');
-        return;
-      }
-      const number = zoneNum;
-      this.platform.log.info(`Sending API request: actionCmd="${action}", actionNum=${number}`);
-      try {
-        await axios.post(
-          `${PUBLIC_API_BASE_URL}/devices/${this.platform.config.deviceId}/actions`,
-          { actionCmd: action, actionNum: number },
-          { headers: { Authorization: `Bearer ${apiKey}` } },
-        );
-        this.platform.log.info(`Controller: Command [${action}] sent via API for zone ${number}`);
-      } catch (e) {
-        this.platform.log.error(`Controller: API command failed: ${(e as Error).message}`);
-        this.platform.log.error(`Failed request: actionCmd="${action}", actionNum=${number}`);
-      }
-      return;
+    try {
+      await this.postAction(actionCmd, actionNum);
+      this.platform.log.info(`Controller: Command [${actionCmd}] sent for ${areaCommand ? 'area' : 'zone'} ${actionNum}`);
+    } catch (e) {
+      this.platform.log.error(`Controller: Command [${actionCmd}] for ${actionNum} failed: ${(e as Error).message}`);
     }
+  }
 
-    if (this.mqttClient && this.mqttClient.connected) {
-      const device = this.auth?.getDevice();
-      if (!device) {
-        return;
-      }
-      const topic = `si/app/v2/${device.IMEI}/control`;
-      const number = action.includes('zone') ? zoneNum : areaNum;
-      const payload = { method: 'POST', data: [action, number] };
-      this.mqttClient.publish(topic, JSON.stringify(payload), { qos: 1 });
-      this.platform.log.info(`Controller: Sent command [${action}]${action.includes('zone') ? ` for zone ${zoneNum}` : ''}`);
-    } else {
-      this.platform.log.warn('Controller: MQTT disconnected, trying fallback API');
-      const apiKey = this.platform.config.fallbackAuth?.apiKey;
-      if (!apiKey) {
-        return;
-      }
-      const number = action.includes('zone') ? zoneNum : areaNum;
-      try {
-        await axios.post(
-          `${PUBLIC_API_BASE_URL}/devices/${this.platform.config.deviceId}/actions`,
-          { actionCmd: action, actionNum: number },
-          { headers: { Authorization: `Bearer ${apiKey}` } },
-        );
-        this.platform.log.info(`Controller: Command [${action}] sent via API`);
-      } catch (e) {
-        this.platform.log.error(`Controller: API command failed: ${(e as Error).message}`);
-      }
+  private async postAction(actionCmd: string, actionNum: number): Promise<void> {
+    this.platform.log.debug(`Controller: POST /devices/${this.deviceId}/actions { actionCmd: "${actionCmd}", actionNum: ${actionNum} }`);
+    try {
+      const response = await this.http.post(`/devices/${this.deviceId}/actions`, { actionCmd, actionNum });
+      this.platform.log.debug(`Controller: [${actionCmd} ${actionNum}] HTTP ${response.status}`);
+    } catch (e) {
+      const status = (e as { response?: { status?: number } }).response?.status;
+      this.platform.log.debug(`Controller: [${actionCmd} ${actionNum}] failed: ${status ? `HTTP ${status}` : (e as Error).message}`);
+      throw e;
     }
   }
 
@@ -362,8 +427,7 @@ export class OlarmController {
    */
   activatePollingFallback(): void {
     const interval = (this.platform.config.pollingInterval || 300) * 1000;
-    if (interval > 0 && !this.pollingTimer) {
-      this.refreshState();
+    if (interval > 0 && !this.pollingTimer && !this.stopped) {
       this.platform.log.info(`Controller: Polling activated (every ${interval / 1000}s)`);
       this.pollingTimer = setInterval(() => {
         this.refreshState();
@@ -383,34 +447,18 @@ export class OlarmController {
   }
 
   /**
-   * Handle authentication errors by refreshing token and reconnecting
+   * Disconnect and stop all timers
    */
-  private async handleAuthError(): Promise<void> {
-    if (!this.auth) {
-      return;
+  stop(): void {
+    this.stopped = true;
+    this.mqttClient?.end(true);
+    if (this.pollingTimer) {
+      clearInterval(this.pollingTimer);
+      this.pollingTimer = null;
     }
-
-    this.platform.log.info('Controller: Refreshing authentication token...');
-
-    try {
-      // Disconnect existing MQTT client to stop reconnect loop
-      if (this.mqttClient) {
-        this.mqttClient.removeAllListeners();
-        this.mqttClient.end(true);
-        this.mqttClient = null;
-      }
-
-      // Refresh the access token
-      await this.auth.ensureAccessTokenIsValid();
-
-      this.platform.log.info('Controller: Token refreshed successfully, reconnecting to MQTT...');
-
-      // Reconnect with new token
-      this.connect(this.auth);
-    } catch (error) {
-      this.platform.log.error(`Controller: Failed to refresh token: ${(error as Error).message}`);
-      this.platform.log.warn('Controller: Falling back to API polling');
-      this.activatePollingFallback();
+    if (this.startRetryTimer) {
+      clearTimeout(this.startRetryTimer);
+      this.startRetryTimer = null;
     }
   }
 

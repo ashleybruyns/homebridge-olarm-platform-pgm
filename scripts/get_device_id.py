@@ -2,167 +2,85 @@
 """
 Olarm Device ID Retriever
 
-This script authenticates with the Olarm API and retrieves all devices
-associated with your account, displaying their Device IDs and IMEIs.
+Lists the devices your Olarm API key can access, with the Device ID
+needed for the Homebridge config, using the Olarm public API.
 
 Usage:
     python3 get_device_id.py
 
-Requirements:
-    pip install requests
+Get an API key from the Olarm user portal (https://user.olarm.com) under API access.
+Only devices with API access enabled are listed.
 """
 
-import requests
-import json
 import getpass
+import json
 import sys
+import urllib.error
+import urllib.request
 
-# Define the API endpoints
-AUTH_BASE_URL = 'https://auth.olarm.com'
-LEGACY_API_BASE_URL = 'https://api-legacy.olarm.com'
+API_BASE_URL = 'https://api.olarm.com/api/v4'
 
 
 def main():
-    """
-    Retrieves all Olarm devices and their IDs for the authenticated user.
-    """
     print("=" * 60)
     print(" Olarm Device ID Retriever")
-    print(" For homebridge-olarm-platform configuration")
     print("=" * 60)
-    
-    # Get credentials
-    email = input("\nEnter your Olarm account email: ").strip()
-    password = getpass.getpass("Enter your Olarm account password: ")
-    
-    if not email or not password:
-        print("\n❌ Email and password are required.")
+
+    api_key = getpass.getpass("\nEnter your Olarm API key: ").strip()
+    if not api_key:
+        print("❌ An API key is required.")
         sys.exit(1)
-    
-    session = requests.Session()
-    
+
+    request = urllib.request.Request(
+        f'{API_BASE_URL}/devices?page=1&pageLength=100&deviceApiAccessOnly=1',
+        headers={'Authorization': f'Bearer {api_key}'},
+    )
+
     try:
-        # Step 1: Login
-        print("\n[1/3] Authenticating...", end=" ")
-        login_url = f'{AUTH_BASE_URL}/api/v4/oauth/login/mobile'
-        login_response = session.post(login_url, data={
-            'userEmailPhone': email,
-            'userPass': password,
-        })
-        login_response.raise_for_status()
-        login_data = login_response.json()
-        access_token = login_data.get('oat')
-        
-        if not access_token:
-            raise ValueError("Login failed - no access token received.")
-        print("✓ Success")
-        
-        # Step 2: Get user index
-        print("[2/3] Fetching user details...", end=" ")
-        user_index_url = f'{AUTH_BASE_URL}/api/v4/oauth/federated-link-existing?oat={access_token}'
-        user_index_response = session.post(user_index_url, data={
-            'userEmailPhone': email,
-            'userPass': password,
-            'captchaToken': 'olarmapp',
-        })
-        user_index_response.raise_for_status()
-        user_index_data = user_index_response.json()
-        user_index = user_index_data.get('userIndex')
-        
-        if not user_index:
-            raise ValueError("User index not found.")
-        print(f"✓ Success (User Index: {user_index})")
-        
-        # Step 3: Get devices
-        print("[3/3] Retrieving device list...", end=" ")
-        devices_url = f'{LEGACY_API_BASE_URL}/api/v2/users/{user_index}'
-        devices_response = session.get(
-            devices_url,
-            headers={'Authorization': f'Bearer {access_token}'}
-        )
-        devices_response.raise_for_status()
-        devices_data = devices_response.json()
-        devices = devices_data.get('devices', [])
-        print(f"✓ Success ({len(devices)} device(s) found)")
-        
-        if not devices:
-            print("\n⚠️  No devices found for this account.")
-            print("Please ensure you have devices registered in the Olarm app.")
-            return
-        
-        # Display results
-        print("\n" + "=" * 60)
-        print(" YOUR OLARM DEVICES")
-        print("=" * 60)
-        
-        for i, device in enumerate(devices, 1):
-            device_name = device.get('deviceName', 'Unnamed Device')
-            device_id = device.get('id', 'N/A')
-            device_imei = device.get('IMEI', 'N/A')
-            
-            print(f"\n📱 DEVICE #{i}: {device_name}")
-            print(f"   Device ID:   {device_id}")
-            print(f"   IMEI:        {device_imei}")
-        
-        print("\n" + "=" * 60)
-        print("\n✅ Configuration Instructions:")
-        print("\n1. Copy the 'Device ID' value from above")
-        print("2. Add it to your Homebridge config.json:")
-        print('\n   "platforms": [')
-        print('     {')
-        print('       "platform": "Olarm",')
-        print('       "name": "Olarm",')
-        print(f'       "deviceId": "{devices[0].get("id", "YOUR_DEVICE_ID")}",')
-        print('       "primaryAuth": {')
-        print(f'         "email": "{email}",')
-        print('         "password": "YOUR_PASSWORD"')
-        print('       }')
-        print('     }')
-        print('   ]')
-        print("\n3. Restart Homebridge")
-        print("\n" + "=" * 60)
-    
-    except requests.exceptions.HTTPError as e:
-        print("\n")
-        print("=" * 60)
-        print(" ❌ ERROR")
-        print("=" * 60)
-        print(f"\nHTTP Error: {e.response.status_code} {e.response.reason}")
+        with urllib.request.urlopen(request, timeout=15) as response:
+            result = json.load(response)
+    except urllib.error.HTTPError as e:
+        body = e.read().decode(errors='replace')
         try:
-            error_body = e.response.json()
-            message = error_body.get('message', e.response.text)
-            print(f"Message: {message}")
+            message = json.loads(body).get('message', body)
         except json.JSONDecodeError:
-            print(f"Response: {e.response.text}")
-        
-        if e.response.status_code == 401:
-            print("\n💡 Tip: Check your email and password are correct.")
-        print("=" * 60)
+            message = body
+        print(f"\n❌ HTTP {e.code}: {message}")
+        if e.code in (401, 403):
+            print("💡 Check the API key is correct and still active in the Olarm user portal.")
         sys.exit(1)
-    
-    except requests.exceptions.RequestException as e:
-        print("\n")
-        print("=" * 60)
-        print(" ❌ NETWORK ERROR")
-        print("=" * 60)
-        print(f"\nFailed to connect to Olarm API: {e}")
-        print("\n💡 Tip: Check your internet connection.")
-        print("=" * 60)
+    except urllib.error.URLError as e:
+        print(f"\n❌ Could not reach the Olarm API: {e.reason}")
         sys.exit(1)
-    
-    except Exception as e:
-        print("\n")
-        print("=" * 60)
-        print(" ❌ UNEXPECTED ERROR")
-        print("=" * 60)
-        print(f"\n{type(e).__name__}: {e}")
-        print("=" * 60)
+
+    devices = result.get('data', [])
+    if not devices:
+        print("\nNo devices found. Make sure API access is enabled for your device in the Olarm user portal.")
         sys.exit(1)
+
+    print("\n" + "=" * 60)
+    print(" YOUR OLARM DEVICES")
+    print("=" * 60)
+    for i, device in enumerate(devices, 1):
+        print(f"\n📱 DEVICE #{i}: {device.get('deviceName', 'Unnamed Device')}")
+        print(f"   Device ID:   {device.get('deviceId', 'N/A')}")
+
+    print("\n" + "=" * 60)
+    print("\n✅ Add the Device ID and your API key to your Homebridge config:")
+    print('\n   "platforms": [')
+    print('     {')
+    print('       "platform": "Olarm",')
+    print('       "name": "Olarm",')
+    print(f'       "deviceId": "{devices[0].get("deviceId", "YOUR_DEVICE_ID")}",')
+    print('       "apiKey": "YOUR_API_KEY"')
+    print('     }')
+    print('   ]')
+    print("\nThen restart Homebridge.")
 
 
 if __name__ == "__main__":
     try:
         main()
     except KeyboardInterrupt:
-        print("\n\n⚠️  Cancelled by user")
-        sys.exit(0)
+        print("\nCancelled.")
+        sys.exit(1)

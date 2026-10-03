@@ -1,32 +1,45 @@
-# Homebridge Olarm Platform
+# Homebridge Olarm Platform (Gates & PGM)
 
-[![npm version](https://badge.fury.io/js/homebridge-olarm-platform.svg)](https://badge.fury.io/js/homebridge-olarm-platform)
+A Homebridge plugin for Olarm security systems, using the official Olarm API: real-time MQTT updates, automatic zone discovery, and gate control through PGM outputs.
 
-A comprehensive Homebridge plugin for Olarm security systems with real-time MQTT events and automatic zone discovery.
+Published on npm as **`homebridge-olarm-platform-pgm`**. It is a fork of [homebridge-olarm-platform](https://github.com/vangogh27/homebridge-olarm-platform) by Louis Germishuys.
 
 ## Features
 
-- **Real-time MQTT Updates** - Instant state changes via native app protocol
+- **Real-time MQTT Updates** - Instant state changes via Olarm's official public MQTT feed
 - **Automatic Zone Discovery** - Automatically creates sensors for all configured zones
 - **Zone Bypass Support** - Optional switches to bypass individual zones
 - **Automation Switches** - Create custom bypass-and-arm sequences
+- **Gates** - Combine a zone and a PGM into a HomeKit Garage Door for gates
+- **Single API Key** - Uses the Olarm public API; no account password needed
 - **API Fallback** - Automatic polling when MQTT unavailable
-- **Token Caching** - Persistent authentication to avoid rate limiting
 - **Detailed Logging** - Emoji-enhanced logs for all state changes
 
 ## Installation
 
 ### Via Homebridge UI (Recommended)
 
-1. Search for "Olarm" in the Homebridge UI plugin search
+1. Search for `homebridge-olarm-platform-pgm` in the Homebridge UI plugin search (listed as "Olarm Security System (Gates & PGM)")
 2. Click **Install**
 3. Configure the plugin using the settings UI
 
 ### Via Command Line
 
 ```bash
-npm install -g homebridge-olarm-platform
+npm install -g homebridge-olarm-platform-pgm
 ```
+
+### Switching from homebridge-olarm-platform
+
+Both plugins register the same `Olarm` platform, so only one can be installed at a time:
+
+1. Note your device ID, and get an API key (see [Getting Your API Key](#getting-your-api-key))
+2. Uninstall `homebridge-olarm-platform`
+3. Install `homebridge-olarm-platform-pgm`
+4. Your existing `Olarm` config block is reused. Add `apiKey` and remove `primaryAuth` (see [Upgrading from email/password login](#upgrading-from-emailpassword-login))
+5. Restart Homebridge
+
+The accessories are registered again under the new plugin. Check their rooms and any HomeKit automations afterwards, as these may need setting up again.
 
 ## Configuration
 
@@ -39,10 +52,7 @@ npm install -g homebridge-olarm-platform
       "platform": "Olarm",
       "name": "Olarm",
       "deviceId": "YOUR_DEVICE_ID",
-      "primaryAuth": {
-        "email": "your-email@example.com",
-        "password": "your-password"
-      }
+      "apiKey": "YOUR_API_KEY"
     }
   ]
 }
@@ -58,13 +68,8 @@ npm install -g homebridge-olarm-platform
       "name": "Olarm",
       "deviceId": "YOUR_DEVICE_ID",
       "deviceName": "Home Security",
-      "primaryAuth": {
-        "email": "your-email@example.com",
-        "password": "your-password"
-      },
-      "fallbackAuth": {
-        "apiKey": "YOUR_API_KEY"
-      },
+      "apiKey": "YOUR_API_KEY",
+      "mqttClientIdSuffix": "8",
       "includedZones": [1, 2, 3, 4, 5],
       "addBypassSwitches": true,
       "pollingInterval": 300,
@@ -81,6 +86,15 @@ npm install -g homebridge-olarm-platform
           "zones": [5],
           "armMode": "arm"
         }
+      ],
+      "gates": [
+        {
+          "id": "driveway-gate",
+          "name": "Driveway Gate",
+          "zone": 6,
+          "pgm": 1,
+          "operationTime": 20
+        }
       ]
     }
   ]
@@ -95,13 +109,13 @@ npm install -g homebridge-olarm-platform
 | `name` | string | ✅ | Platform name for Homebridge |
 | `deviceId` | string | ✅ | Your Olarm device ID |
 | `deviceName` | string | ❌ | Display name for security system (default: "Olarm Security") |
-| `primaryAuth.email` | string | ✅ | Your Olarm account email |
-| `primaryAuth.password` | string | ✅ | Your Olarm account password |
-| `fallbackAuth.apiKey` | string | ❌ | API key for fallback polling when MQTT unavailable |
+| `apiKey` | string | ✅ | Olarm API key (see [Getting Your API Key](#getting-your-api-key)) |
+| `mqttClientIdSuffix` | string | ❌ | Suffix for the MQTT client ID (default: `8`). Must differ from any other Olarm integration using the same account, e.g. Home Assistant |
 | `includedZones` | array | ❌ | Zone numbers to include (empty = all zones) |
 | `addBypassSwitches` | boolean | ❌ | Add bypass switches for each zone (default: false) |
-| `pollingInterval` | number | ❌ | Seconds between API polls when MQTT down (default: 300) |
+| `pollingInterval` | number | ❌ | Seconds between API polls while MQTT is down (default: 300) |
 | `automations` | array | ❌ | Custom automation switches (see below) |
+| `gates` | array | ❌ | Gates built from a zone + PGM (see below) |
 
 ### Automation Configuration
 
@@ -121,152 +135,81 @@ Each automation creates a stateless switch that bypasses specific zones and then
 - `zones`: Array of zone numbers to bypass before arming
 - `armMode`: `arm` (Away), `stay` (Stay), or `sleep` (Night)
 
+### Gate Configuration
+
+Each gate is exposed to HomeKit as a Garage Door accessory, combining a zone (for open/closed state) with a PGM (to trigger the gate motor):
+
+```json
+{
+  "id": "unique-identifier",
+  "name": "Driveway Gate",
+  "zone": 6,
+  "pgm": 1,
+  "operationTime": 20
+}
+```
+
+- `id`: Unique identifier (optional; defaults to the zone and PGM numbers)
+- `name`: Name shown in HomeKit
+- `zone`: Olarm zone number whose sensor is closed only when the gate is fully closed
+- `pgm`: Olarm PGM number that is pulsed to trigger the gate motor. It must be enabled and allow pulse control on the panel; the plugin checks this and refuses to use any other PGM
+- `operationTime`: Seconds the gate takes to fully open/close (default: 20). Further open/close requests are blocked for this long after each pulse
+
+This assumes the PGM is wired to the gate motor the way a remote button typically is: a single pulse toggles the gate, and a pulse while it is moving stops or reverses it. Because the PGM holds no state, the zone is the only source of truth, and the plugin pulses the PGM only when all of these hold:
+
+- The zone reads exactly closed (`c`) or open (`a`). While it is bypassed (`b`) or reports anything else, the gate's position is unknown and control is disabled.
+- The reading is recent (under 90 seconds old) and the panel is not offline. If not, the plugin fetches a fresh reading from the API first. The MQTT feed only sends changes, so after a quiet spell this costs one quick API request.
+- No movement is in progress, including an opening started from a remote or keypad (detected when the zone goes from closed to open). Repeating the same request (a double tap, or a scene running again) is ignored; the opposite request is refused until `operationTime` has passed.
+- The PGM is enabled and allows pulse control (from the panel profile's `pgmControl` settings).
+- The requested state differs from the zone's current state.
+
+Otherwise the request is refused and the Home app shows "No Response", rather than the gate moving unexpectedly. If sending a pulse fails or times out, requests are still blocked for `operationTime`, since the pulse may have reached the panel.
+
 ## Getting Your Device ID
 
-### Python Script (Detailed)
+The quickest way: set `deviceId` to any value and start Homebridge. If it doesn't match, the log lists every device your API key can access, with its ID.
 
-Use this script to retrieve all your devices with their IDs and IMEIs:
+Alternatively, run the included script, which only needs Python 3:
 
-<details>
-<summary>Click to expand Device ID retriever script</summary>
-
-Save as `get_device_id.py`:
-
-```python
-import requests
-import json
-import getpass
-
-# Define the API endpoints
-AUTH_BASE_URL = 'https://auth.olarm.com'
-LEGACY_API_BASE_URL = 'https://api-legacy.olarm.com'
-
-def main():
-    """
-    Retrieves all Olarm devices and their IDs for the authenticated user.
-    """
-    print("--- Olarm Device ID Retriever ---")
-    
-    # Get credentials
-    email = input("Enter your Olarm account email: ")
-    password = getpass.getpass("Enter your Olarm account password: ")
-    
-    session = requests.Session()
-    
-    try:
-        # Step 1: Login
-        print("\nStep 1: Authenticating...")
-        login_url = f'{AUTH_BASE_URL}/api/v4/oauth/login/mobile'
-        login_response = session.post(login_url, data={
-            'userEmailPhone': email,
-            'userPass': password,
-        })
-        login_response.raise_for_status()
-        login_data = login_response.json()
-        access_token = login_data.get('oat')
-        
-        if not access_token:
-            raise ValueError("Login failed - no access token received.")
-        print("✓ Login successful.")
-        
-        # Step 2: Get user index
-        print("Step 2: Fetching user details...")
-        user_index_url = f'{AUTH_BASE_URL}/api/v4/oauth/federated-link-existing?oat={access_token}'
-        user_index_response = session.post(user_index_url, data={
-            'userEmailPhone': email,
-            'userPass': password,
-            'captchaToken': 'olarmapp',
-        })
-        user_index_response.raise_for_status()
-        user_index_data = user_index_response.json()
-        user_index = user_index_data.get('userIndex')
-        
-        if not user_index:
-            raise ValueError("User index not found.")
-        print(f"✓ User details found (User Index: {user_index}).")
-        
-        # Step 3: Get devices
-        print("Step 3: Retrieving device list...")
-        devices_url = f'{LEGACY_API_BASE_URL}/api/v2/users/{user_index}'
-        devices_response = session.get(
-            devices_url,
-            headers={'Authorization': f'Bearer {access_token}'}
-        )
-        devices_response.raise_for_status()
-        devices_data = devices_response.json()
-        devices = devices_data.get('devices', [])
-        
-        if not devices:
-            print("\nNo devices found for this account.")
-            return
-        
-        # Display results
-        print(f"\n✓ Success! Found {len(devices)} device(s).\n")
-        print("="*60)
-        for i, device in enumerate(devices, 1):
-            print(f" DEVICE #{i}")
-            print(f" Device Name: {device.get('deviceName', 'N/A')}")
-            print(f" Device ID (for config.json): {device.get('id', 'N/A')}")
-            print(f" Device IMEI (for MQTT): {device.get('IMEI', 'N/A')}")
-            print("-"*60)
-    
-    except requests.exceptions.HTTPError as e:
-        print(f"\n--- ERROR ---")
-        print(f"API error: {e.response.status_code} {e.response.reason}")
-        try:
-            error_body = e.response.json()
-            print(f"Message: {error_body.get('message', e.response.text)}")
-        except json.JSONDecodeError:
-            print(f"Response: {e.response.text}")
-    except Exception as e:
-        print(f"\n--- Unexpected error ---")
-        print(e)
-
-if __name__ == "__main__":
-    main()
-```
-
-Run with:
 ```bash
-python3 get_device_id.py
+python3 scripts/get_device_id.py
 ```
 
-**Required:** `pip install requests`
+Or call the API directly:
 
-</details>
+```bash
+curl -H "Authorization: Bearer YOUR_API_KEY" "https://api.olarm.com/api/v4/devices"
+```
 
-## Getting Your API Key (Optional)
+Only devices with API access enabled in the Olarm user portal are returned.
 
-API key is only needed for fallback polling:
+## Getting Your API Key
 
-1. Log into [Olarm web portal](https://login.olarm.com/)
-2. Go to API access (if unavailable go to https://user.olarm.com/#/api once logged in)
-3. Generate a new API key
-4. Add it to `fallbackAuth.apiKey` in config
+1. Log into the [Olarm user portal](https://user.olarm.com/)
+2. Go to **API access** (https://user.olarm.com/#/api)
+3. Generate a new API key, and make sure API access is enabled for your device
+4. Add it to `apiKey` in the config
 
 ## How It Works
 
-### Authentication
-
-The plugin uses Olarm's native app authentication protocol:
-- Login with email/password
-- Tokens cached to `~/.homebridge/olarm_tokens.json`
-- Automatic token refresh
-- No rate limiting issues on restart
+The plugin uses the [Olarm public API](https://user.olarm.com/#/api/documentation) with your API key:
 
 ### Real-time Updates
 
-- Connects to Olarm MQTT broker via WebSocket
-- Subscribes to device state updates
-- Instant notification of all state changes
-- Automatic reconnection on network issues
+- Connects to Olarm's official MQTT feed over WebSockets (`mqtt-pubapi.olarm.com`), the same feed used by Olarm's own [client library](https://github.com/olarmtech/olarmflowclient-python) and Home Assistant integration
+- Subscribes to your device; state changes arrive instantly
+- Reconnects automatically, backing off if the broker keeps refusing the connection
+
+### State and Commands
+
+- The full device state is read from the REST API (`https://api.olarm.com/api/v4`) at startup and after every MQTT reconnect, since the feed only sends changes
+- Arm/disarm, zone bypass and PGM commands are sent through the REST API
 
 ### Fallback Polling
 
-If MQTT connection fails:
-- Automatically switches to API polling
-- Configurable polling interval
-- Returns to MQTT when connection restored
+If the MQTT connection is down:
+- The plugin polls the REST API every `pollingInterval` seconds
+- Polling stops again once MQTT reconnects
 
 ## Accessories Created
 
@@ -301,33 +244,57 @@ Stateless switches that execute sequences:
 3. Arm system in specified mode
 4. Switch returns to off
 
+### Gates (Optional)
+
+Created from the `gates` config array, one Garage Door accessory per entry:
+- **Current state** - Reflects the configured zone (open/closed); "Stopped" while the position is unknown
+- **Target state** - Setting it in the Home app pulses the configured PGM, subject to the safety checks above
+- Shows "Opening" until `operationTime` has passed, and "Closing" until the zone confirms closed
+- Reports "Stopped" if the zone doesn't confirm the new state within `operationTime`
+
 ## Logging
 
 The plugin provides detailed, emoji-enhanced logging:
 
 ```
 🔒 Area 1: Disarmed → Armed Away
-🚪 Front Door: Ready (Closed) → Active (Open)
-🚶 Lounge PIR: Ready (Closed) → Active (Open)
-⏭️ Garage Door: Ready (Closed) → Bypassed
+🚪 Front Door: Closed → Active (Open)
+🚶 Lounge PIR: Closed → Active (Open)
+⏭️ Garage Door: Closed → Bypassed
 ⚡ PGM 1: Activated
 🟢 AC Power: OK
 🔴 Battery Low: FAULT
 ```
 
+### Debug Logging
+
+Turn on Homebridge debug mode (`-D`, or **Homebridge Debug Mode** in the Homebridge UI settings) to also log:
+- The MQTT client ID and topic used, and the fields in each MQTT message
+- The panel's `deviceStatus` and PGM settings (`pgmControl`) read at startup, and `deviceStatus` on every API read
+- Every command sent to Olarm and the HTTP status it returned
+- For each gate: every zone reading, the reasoning behind each open/close request (reading, its age, panel status, movement lock), and when the movement lock is released
+
 ## Troubleshooting
 
 ### Plugin won't start
 
-- Check `primaryAuth` credentials are correct
-- Verify `deviceId` matches your Olarm device
+- Check `apiKey` is set and still active in the Olarm user portal
+- Verify `deviceId` matches your Olarm device; the log lists the available devices if it doesn't
 - Check Homebridge logs for error messages
 
-### MQTT keeps disconnecting
+### Upgrading from email/password login
 
-- Check network stability
-- Plugin logs reconnection attempts per hour
-- Fallback polling activates automatically
+Earlier versions logged in with your Olarm email and password. These are no longer used:
+- Move the API key from `fallbackAuth.apiKey` to `apiKey` (the old location still works, with a warning)
+- Remove `primaryAuth`
+- The old token cache file `olarm_tokens.json` in the Homebridge storage folder can be deleted
+
+### MQTT won't connect or keeps disconnecting
+
+- Check the API key is valid
+- If another Olarm integration (such as Home Assistant) uses the same account, give this plugin a different `mqttClientIdSuffix`. Two connections with the same client ID keep disconnecting each other
+- Check network stability; the plugin logs how many times it disconnected in the last hour
+- Fallback polling activates automatically while MQTT is down
 
 ### Zones not appearing
 
@@ -337,23 +304,21 @@ The plugin provides detailed, emoji-enhanced logging:
 
 ### Bypass not working
 
-- Bypass commands require API key in `fallbackAuth.apiKey`
 - Check API key is valid in Olarm portal
 - Verify zone number is correct
 
-### Token errors on restart
+### Gate refuses to operate
 
-- Delete `~/.homebridge/olarm_tokens.json`
-- Restart Homebridge to force fresh login
-- Check credentials haven't changed
+- Check the log for the reason: an unknown or out-of-date zone reading, a movement still in progress, or a PGM that isn't enabled for pulse control
+- In the Olarm app, check the gate's PGM is enabled and set up for pulse control
 
 ## Development
 
 ### Setup
 
 ```bash
-git clone https://github.com/vangogh27/homebridge-olarm-platform.git
-cd homebridge-olarm-platform
+git clone https://github.com/ashleybruyns/homebridge-olarm-platform-pgm.git
+cd homebridge-olarm-platform-pgm
 npm install
 npm run build
 ```
@@ -387,8 +352,7 @@ Contributions welcome! Please:
 
 ## Support
 
-- **Issues**: [GitHub Issues](https://github.com/vangogh27/homebridge-olarm-platform/issues)
-- **Discussions**: [GitHub Discussions](https://github.com/vangogh27/homebridge-olarm-platform/discussions)
+- **Issues**: [GitHub Issues](https://github.com/ashleybruyns/homebridge-olarm-platform-pgm/issues)
 
 ## License
 
@@ -396,9 +360,9 @@ Apache-2.0 License - see [LICENSE](LICENSE) file for details.
 
 ## Credits
 
-- Created by Louis Germishuys
+- Forked from [homebridge-olarm-platform](https://github.com/vangogh27/homebridge-olarm-platform), created by Louis Germishuys
 - Built with [Homebridge Plugin Template](https://github.com/homebridge/homebridge-plugin-template)
-- Uses Olarm's native app protocol for real-time updates
+- Uses Olarm's public API and official MQTT feed for real-time updates
 
 ## Disclaimer
 

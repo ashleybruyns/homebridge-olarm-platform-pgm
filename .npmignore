@@ -137,3 +137,6 @@ test/
 
 #scripts
 scripts/
+# local reference docs and agent notes
+*.pdf
+CLAUDE.md

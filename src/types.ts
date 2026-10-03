@@ -11,17 +11,19 @@ export interface OlarmPlatformConfig {
   name: string;
   deviceId: string;
   deviceName?: string;
-  primaryAuth: {
-    email: string;
-    password: string;
-  };
+  apiKey?: string;
+  /** @deprecated Older location of the API key; use `apiKey` */
   fallbackAuth?: {
     apiKey?: string;
   };
+  /** @deprecated Native app login, no longer used */
+  primaryAuth?: unknown;
+  mqttClientIdSuffix?: string;
   includedZones?: number[];
   addBypassSwitches?: boolean;
   pollingInterval?: number;
   automations?: AutomationConfig[];
+  gates?: GateConfig[];
 }
 
 /**
@@ -35,22 +37,26 @@ export interface AutomationConfig {
 }
 
 /**
- * Olarm device information from API
+ * Gate configuration
+ * Pairs a zone (reports open/closed state) with a PGM (pulsed to trigger the gate motor)
  */
-export interface OlarmDevice {
-  id: string;
-  IMEI: string;
-  name?: string;
-  deviceFirmware?: string;
+export interface GateConfig {
+  id?: string;
+  name: string;
+  zone: number;
+  pgm: number;
+  operationTime?: number;
 }
 
 /**
- * User information from auth API
+ * Response from GET /devices
  */
-export interface OlarmUser {
-  userIndex: number;
-  userId: string;
-  devices: OlarmDevice[];
+export interface OlarmDevicesResponse {
+  userId?: string;
+  data?: Array<{
+    deviceId: string;
+    deviceName?: string;
+  }>;
 }
 
 /**
@@ -59,7 +65,11 @@ export interface OlarmUser {
 export interface DeviceProfile {
   zonesLabels?: string[];
   pgmLabels?: string[];
-  areaLabels?: string[];
+  /**
+   * Per-PGM capability flags, e.g. "101": [0] enabled, [1] open/close allowed, [2] pulse allowed
+   */
+  pgmControl?: string[];
+  areasLabels?: string[];
 }
 
 /**
@@ -73,32 +83,25 @@ export interface DeviceState {
 }
 
 /**
- * Complete device data structure
+ * Device data from GET /devices/{deviceId}
  */
 export interface DeviceData {
+  deviceId?: string;
+  deviceName?: string;
   deviceState: DeviceState;
-  deviceStatus: 'online' | 'offline';
+  deviceStatus?: string;
   deviceProfile?: DeviceProfile;
   deviceFirmware?: string;
 }
 
 /**
- * MQTT payload structure
+ * Message on the public MQTT feed (v4/devices/{deviceId}). Messages carry
+ * different parts of the device data; only the parts present are updated.
  */
-export interface MqttPayload {
-  type: string;
-  data?: DeviceState;
-}
-
-/**
- * Cached token data
- */
-export interface TokenCache {
-  accessToken: string;
-  refreshToken: string;
-  tokenExpiration: number;
-  userIndex: number;
-  userId: string;
+export interface OlarmMqttPayload {
+  deviceState?: DeviceState;
+  deviceStatus?: string;
+  deviceProfile?: DeviceProfile;
 }
 
 /**
@@ -108,6 +111,7 @@ export interface OlarmAccessoryContext {
   deviceId: string;
   firmware: string;
   zoneNum?: number;
+  pgmNum?: number;
 }
 
 /**
